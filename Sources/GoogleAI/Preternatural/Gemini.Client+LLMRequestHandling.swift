@@ -36,7 +36,7 @@ extension Gemini.Client: LLMRequestHandling {
         
         return try cast(_completion)
     }
-        
+    
     private func _complete(
         prompt: AbstractLLM.TextPrompt,
         parameters: AbstractLLM.TextCompletionParameters
@@ -80,7 +80,102 @@ extension Gemini.Client: LLMRequestHandling {
             message: try AbstractLLM.ChatMessage(_from: firstCandidate.content),
             stopReason: try AbstractLLM.ChatCompletion.StopReason(_from: firstCandidate.finishReason.unwrap())
         )
-                
+        
+        return completion
+    }
+    
+    
+    // Function Calling
+    public func _complete(
+        _ messages: [AbstractLLM.ChatMessage],
+        functions: [AbstractLLM.ChatFunctionDefinition],
+        model: Gemini.Model,
+        as type: AbstractLLM.ChatFunctionCall.Type
+    ) async throws -> [FunctionCall] {
+        let service = GenerativeAIService(
+            apiKey: configuration.apiKey,
+            urlSession: .shared
+        )
+        
+        let functionDeclarations: [FunctionDeclaration] = functions.map { function in
+            let parameterSchemas = function.parameters.properties?.reduce(into: [String: Schema]()) { result, property in
+                result[property.key] = Schema(
+                    type: .string,
+                    description: property.value.description
+                )
+            } ?? [:]
+            
+            return FunctionDeclaration(
+                name: function.name.rawValue,
+                description: function.context,
+                parameters: parameterSchemas,
+                requiredParameters: function.parameters.required
+            )
+        }
+        
+        let systemMessage = messages.first { $0.role == .system }
+        let systemInstruction = ModelContent(
+            role: "system",
+            parts: [.text(try systemMessage?.content._stripToText() ?? "")]
+        )
+        
+        let userMessages = messages.filter { $0.role != .system }
+        let userContent = userMessages.map { message in
+            ModelContent(
+                role: "user",
+                parts: [.text(try! message.content._stripToText())]
+            )
+        }
+
+        let request = GenerateContentRequest(
+            model: "models/" + model.rawValue,
+            contents: userContent,
+            generationConfig: nil,
+            safetySettings: nil,
+            tools: [Tool(functionDeclarations: functionDeclarations)],
+            toolConfig: ToolConfig(functionCallingConfig: FunctionCallingConfig(mode: .auto)),
+            systemInstruction: systemInstruction,
+            isStreaming: false,
+            options: RequestOptions()
+        )
+        
+        let response = try await service.loadRequest(request: request)
+        
+        let functionCalls = response.candidates.first?.content.parts.compactMap { part -> FunctionCall? in
+            if case .functionCall(let functionCall) = part {
+                return functionCall
+            }
+            return nil
+        } ?? []
+
+        return functionCalls
+    }
+    
+    // Code Execution
+    public func _complete(
+        _ messages: [AbstractLLM.ChatMessage],
+        codeExecution: Bool,
+        model: Gemini.Model
+    ) async throws -> AbstractLLM.ChatCompletion {
+        let (systemInstruction, modelContent) = try await _makeSystemInstructionAndModelContent(messages: messages)
+        
+        let generativeModel = GenerativeModel(
+            name: model.rawValue,
+            apiKey: configuration.apiKey,
+            generationConfig: nil,
+            tools: codeExecution ? [Tool(codeExecution: CodeExecution())] : nil,
+            systemInstruction: systemInstruction
+        )
+        
+        let response: GenerateContentResponse = try await generativeModel.generateContent(modelContent)
+        let firstCandidate: CandidateResponse = try response.candidates.toCollectionOfOne().value
+        
+        let completion = AbstractLLM.ChatCompletion(
+            prompt: AbstractLLM.ChatPrompt(messages: messages),
+            message: try AbstractLLM.ChatMessage(_from: firstCandidate.content),
+            stopReason: try AbstractLLM.ChatCompletion.StopReason(_from: firstCandidate.finishReason.unwrap())
+        )
+        
         return completion
     }
 }
@@ -101,7 +196,7 @@ extension Gemini.Client {
             stopSequences: parameters.stops
         )
     }
-
+    
     private func _makeSystemInstructionAndModelContent(
         messages: [AbstractLLM.ChatMessage]
     ) async throws -> (systemInstruction: ModelContent?, content: [ModelContent]) {
@@ -117,19 +212,19 @@ extension Gemini.Client {
         var content: [ModelContent] = []
         
         for message in messages {
-           try  _tryAssert(message.role != .system)
+            try  _tryAssert(message.role != .system)
             
             content.append(try await ModelContent(_from: message))
         }
         
         return (systemInstruction, content)
     }
-
+    
     private func _modelContent(
         from prompt: AbstractLLM.TextPrompt
     ) throws -> [ModelContent] {
         let promptText = try prompt.prefix.promptLiteral._stripToText()
-      
+        
         return [ModelContent(role: "user", parts: promptText)]
     }
     
